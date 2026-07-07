@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.local
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+
+# Personal local tool settings (machine-specific, not shared config)
+.claude/settings.local.json
+
+# Local planning docs (may contain sensitive notes - keep out of the repo)
+*.docx
