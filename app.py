@@ -230,45 +230,24 @@ def _render_ratio_category(title, ratio_result, group_keys):
 # ============================================================
 PERSONAS = [
     {
-        "key": "value_investor",
-        "icon": "🏛️",
-        "name": "Value Investor",
-        "description": "Find undervalued stocks trading below intrinsic value. Buffett-style fundamental analysis with DCF valuation and margin of safety.",
+        "key": "arbitrage_trader",
+        "icon": "⚖️",
+        "name": "Arbitrage Trader",
+        "description": "Exploit mispricing between a stock's intrinsic value and market/peer pricing. DCF valuation with margin of safety, benchmarked against peers.",
         "active": True,
     },
     {
-        "key": "growth_investor",
-        "icon": "🚀",
-        "name": "Growth Investor",
-        "description": "Identify high-growth companies with strong revenue momentum and expanding markets.",
+        "key": "margin_trader",
+        "icon": "📈",
+        "name": "Margin Trader",
+        "description": "Leveraged positioning informed by fundamentals and risk signals.",
         "active": False,
     },
     {
-        "key": "dividend_investor",
-        "icon": "💰",
-        "name": "Dividend Investor",
-        "description": "Build a passive income portfolio with stable dividend-paying companies.",
-        "active": False,
-    },
-    {
-        "key": "passive_investor",
-        "icon": "📊",
-        "name": "Passive Investor",
-        "description": "Simple buy or avoid signals without the complexity. Plain English verdicts.",
-        "active": False,
-    },
-    {
-        "key": "quant_investor",
-        "icon": "⚡",
-        "name": "Quantitative Investor",
-        "description": "Systematic mispricing signals across multiple stocks. Data-driven screening.",
-        "active": False,
-    },
-    {
-        "key": "fund_manager",
-        "icon": "🏦",
-        "name": "Fund Manager",
-        "description": "Institutional-grade analysis with full ratio sets, peer benchmarking, and exportable reports.",
+        "key": "intraday_trader",
+        "icon": "⏱️",
+        "name": "Intraday Trader",
+        "description": "Fast, same-day signals built on live market and fundamental data.",
         "active": False,
     },
 ]
@@ -322,9 +301,7 @@ if "persona" not in st.session_state:
     st.subheader("What type of investor are you?")
     st.write("")
 
-    row1 = st.columns(3)
-    row2 = st.columns(3)
-    persona_columns = list(row1) + list(row2)
+    persona_columns = st.columns(3)
 
     selected_persona = None
     for col, persona in zip(persona_columns, PERSONAS):
@@ -335,7 +312,7 @@ if "persona" not in st.session_state:
         st.session_state.persona = selected_persona["key"]
         st.session_state.persona_name = selected_persona["name"]
         st.session_state.persona_icon = selected_persona["icon"]
-        st.success(f"✅ {selected_persona['name']} selected — Buffett-style analysis activated")
+        st.success(f"✅ {selected_persona['name']} selected — analysis activated")
         time.sleep(1)
         st.rerun()
 
@@ -447,7 +424,7 @@ if "result" in st.session_state:
             st.rerun()
 
     summary_tab_label = (
-        "🏛️ Value Investor Screen" if st.session_state.persona == "value_investor" else "Summary"
+        "⚖️ Arbitrage Trader Screen" if st.session_state.persona == "arbitrage_trader" else "Summary"
     )
     tab_summary, tab_ratios, tab_comps, tab_valuation, tab_management, tab_quality = st.tabs(
         [summary_tab_label, "Ratios", "Comparable Companies", "Valuation Model", "Management Guidance", "Data Quality"]
@@ -471,11 +448,13 @@ if "result" in st.session_state:
         if overall_score is not None:
             st.caption(f"Analysis Quality: {overall_score:.1f}/5.0 — {_quality_rating_label(evaluation.get('quality_rating'))}")
 
-        if st.session_state.persona == "value_investor":
-            # Buffett-style screen: an undervalued price alone isn't enough —
-            # a value investor also wants a real safety cushion (25%+ margin
-            # of safety) and a balance sheet that isn't overleveraged
-            # (debt/equity under 0.5), since debt can wipe out a "cheap" stock.
+        if st.session_state.persona == "arbitrage_trader":
+            # Margin-of-safety + leverage screen (previously labeled "Value
+            # Investor View" before the persona rename to Arbitrage Trader).
+            # Criteria unchanged: a mispricing signal alone isn't enough —
+            # this also wants a real safety cushion (25%+ margin of safety)
+            # and a balance sheet that isn't overleveraged (debt/equity
+            # under 0.5), since debt can wipe out an otherwise "cheap" stock.
             debt_to_equity = (result.get("ratio_result") or {}).get("debt_to_equity")
             margin_of_safety = result.get("margin_of_safety")
             if margin_of_safety is not None and debt_to_equity is not None and margin_of_safety >= 25 and debt_to_equity < 0.5:
@@ -486,7 +465,7 @@ if "result" in st.session_state:
             if margin_of_safety is None or debt_to_equity is None:
                 note = " (some inputs unavailable — treated conservatively as not meeting criteria)"
             st.markdown(
-                f"**Value Investor View:** {buy_line} based on your 25% margin of safety requirement "
+                f"**Arbitrage Trader View:** {buy_line} based on your 25% margin of safety requirement "
                 f"and debt/equity threshold{note}"
             )
 
