@@ -8,6 +8,7 @@ import concurrent.futures
 import time
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
@@ -95,6 +96,25 @@ def _run_analysis(ticker):
     return run_verdict(ticker, financials, market_price)
 
 
+def _get_company_name(ticker):
+    """Best-effort company display name; falls back to the ticker itself."""
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get("longName") or info.get("shortName") or ticker
+    except Exception:
+        return ticker
+
+
+def _get_price_history(ticker):
+    """1-year daily price history for the chart; never raises - an empty/
+    None result just means the chart renders its own "Coming soon" state."""
+    try:
+        history = yf.Ticker(ticker).history(period="1y", interval="1d")
+        return history if not history.empty else None
+    except Exception:
+        return None
+
+
 def _fmt_money(value, decimals=2):
     if value is None or not isinstance(value, (int, float)):
         return "N/A"
@@ -129,6 +149,33 @@ def _verdict_color(reconciled_verdict):
     if "FAIRLY VALUED" in text or "IN LINE" in text:
         return "#1B2A4A", "#64B5F6"
     return "#2B2B2B", "#BDBDBD"
+
+
+def _persona_view(result, persona_key):
+    """Persona-specific buy/no-buy read, as (short_label, full_sentence).
+    Returns (None, None) for personas with no view logic wired up yet
+    (Margin Trader, Intraday Trader) rather than a blank or an error.
+    """
+    if persona_key != "arbitrage_trader":
+        return None, None
+
+    # Margin-of-safety + leverage screen: a mispricing signal alone isn't
+    # enough - this also wants a real safety cushion (25%+ margin of safety)
+    # and a balance sheet that isn't overleveraged (debt/equity under 0.5),
+    # since debt can wipe out an otherwise "cheap" stock.
+    debt_to_equity = (result.get("ratio_result") or {}).get("debt_to_equity")
+    margin_of_safety = result.get("margin_of_safety")
+    meets_criteria = margin_of_safety is not None and debt_to_equity is not None and margin_of_safety >= 25 and debt_to_equity < 0.5
+
+    short_label = "✅ BUY CANDIDATE" if meets_criteria else "❌ NOT A BUY"
+    note = ""
+    if margin_of_safety is None or debt_to_equity is None:
+        note = " (some inputs unavailable — treated conservatively as not meeting criteria)"
+    full_sentence = (
+        f"{short_label} — {'meets' if meets_criteria else 'does not meet'} your investment criteria "
+        f"based on your 25% margin of safety requirement and debt/equity threshold{note}"
+    )
+    return short_label, full_sentence
 
 
 QUALITY_RATING_COLORS = {
@@ -204,7 +251,9 @@ def _render_ratio_category(title, ratio_result, group_keys):
     """Build and render one ratio category as a 2-column (Metric, Display)
     table, colored via a separately-computed style matrix rather than extra
     DataFrame columns — st.dataframe doesn't honor Styler.hide(axis="columns"),
-    so any helper column added to the frame would stay visible.
+    so any helper column added to the frame would stay visible. Renders a
+    "Coming soon" placeholder instead of nothing when none of the group's
+    fields are populated for this ticker.
     """
     metrics, displays, styles = [], [], []
     for key, label, is_pct in group_keys:
@@ -215,14 +264,144 @@ def _render_ratio_category(title, ratio_result, group_keys):
         displays.append(_fmt_pct(value) if is_pct else _fmt_num(value))
         styles.append(_ratio_color(key, value))
 
+    if title:
+        st.subheader(title)
+
     if not metrics:
+        st.markdown("_Coming soon — no data available for this ticker yet._")
         return
 
-    st.subheader(title)
     df = pd.DataFrame({"Metric": metrics, "Display": displays})
     style_matrix = pd.DataFrame({"Metric": [""] * len(df), "Display": styles})
     styled = df.style.apply(lambda _: style_matrix, axis=None).hide(axis="index")
     st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _render_price_chart(price_history):
+    """1-year price line chart via Plotly; a light-theme-styled "Coming soon"
+    note if history couldn't be fetched for this ticker."""
+    if price_history is None or price_history.empty:
+        st.markdown("_Coming soon — price history unavailable for this ticker._")
+        return
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=price_history.index, y=price_history["Close"], mode="lines", line=dict(color="#0F9D8C", width=2)))
+    fig.update_layout(
+        template="plotly_white",
+        height=320,
+        margin=dict(l=10, r=10, t=10, b=10),
+        yaxis_title="Price ($)",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_forecast_table(result):
+    """5-year forecast: DCF (revenue/FCFF) for non-financials, or residual
+    income (EPS/book value/dividends/residual income) for banks/insurers."""
+    valuation_result = result.get("valuation_result") or {}
+    if not result["valuation_available"]:
+        st.markdown(f"_Coming soon — valuation model unavailable ({valuation_result.get('error', 'unknown error')})._")
+        return
+
+    years = [f"Year {i}" for i in range(1, 6)]
+    if result["company_type"] == "non_financial":
+        projected_revenues = valuation_result.get("projected_revenues") or []
+        projected_fcfs = valuation_result.get("projected_fcfs") or []
+        if not projected_revenues or not projected_fcfs:
+            st.markdown("_Coming soon — no forecast data available for this ticker._")
+            return
+        forecast_df = pd.DataFrame({"Revenue": projected_revenues, "FCFF": projected_fcfs}, index=years)
+    else:
+        forecasted_eps = valuation_result.get("forecasted_eps") or []
+        if not forecasted_eps:
+            st.markdown("_Coming soon — no forecast data available for this ticker._")
+            return
+        forecast_df = pd.DataFrame(
+            {
+                "EPS": forecasted_eps,
+                "Book Value/Share": valuation_result.get("forecasted_book_values") or [],
+                "Dividends/Share": valuation_result.get("forecasted_dividends") or [],
+                "Residual Income": valuation_result.get("forecasted_residual_incomes") or [],
+            },
+            index=years,
+        )
+    st.dataframe(forecast_df.style.format(precision=2), use_container_width=True)
+
+
+def _render_peer_comparison(result):
+    """Peer multiples table plus the vs.-peer-median PREMIUM/DISCOUNT badges —
+    the full content of the former Comparable Companies tab."""
+    comps_result = result.get("comps_result") or {}
+    if not result["comps_available"]:
+        st.markdown("_Coming soon — comparable company analysis unavailable (no peers found)._")
+        return
+
+    comp_keys = ["pe_ratio", "pb_ratio", "ps_ratio", "ev_to_ebitda", "net_margin", "roe", "revenue_growth"]
+    comp_labels = ["P/E", "P/B", "P/S", "EV/EBITDA", "Net Margin", "ROE", "Rev Growth"]
+
+    rows = []
+    target_ratios = comps_result.get("target_ratios") or {}
+    rows.append({"Ticker": f"{result['ticker']} (target)", **{label: target_ratios.get(key) for key, label in zip(comp_keys, comp_labels)}})
+    for peer in comps_result.get("peers", []):
+        peer_ratios = peer.get("ratios") or {}
+        rows.append({"Ticker": peer["ticker"], **{label: peer_ratios.get(key) for key, label in zip(comp_keys, comp_labels)}})
+    medians = comps_result.get("peer_medians") or {}
+    rows.append({"Ticker": "Peer Median", **{label: medians.get(key) for key, label in zip(comp_keys, comp_labels)}})
+
+    comps_df = pd.DataFrame(rows)
+
+    def _highlight_target(row):
+        if "(target)" in row["Ticker"]:
+            return ["background-color: #E3F2FD"] * len(row)
+        if row["Ticker"] == "Peer Median":
+            return ["font-style: italic"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(
+        comps_df.style.apply(_highlight_target, axis=1).format(precision=2, na_rep="N/A"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("**vs. Peer Median Signal**")
+    vs_median = comps_result.get("vs_median") or {}
+    badge_cols = st.columns(4)
+    badge_colors = {"PREMIUM": "#F44336", "DISCOUNT": "#4CAF50", "IN LINE": "#64B5F6"}
+    for col, key, label in zip(badge_cols, ["pe_ratio", "pb_ratio", "ev_to_ebitda", "ps_ratio"], ["P/E", "P/B", "EV/EBITDA", "P/S"]):
+        signal = vs_median.get(key)
+        color = badge_colors.get(signal, "#888")
+        col.markdown(
+            f"<div style='text-align:center; padding:8px; border-radius:6px; background-color:{color}22; border:1px solid {color};'>"
+            f"<div style='font-size:0.8em; color:#555;'>{label}</div>"
+            f"<div style='font-weight:700; color:{color};'>{signal or 'N/A'}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+
+def _render_data_quality_scores(result):
+    """Condensed dimension-score table (the headline of the former Data
+    Quality tab) - full issues/recommendations/metadata live in the
+    "Data Quality Details" expander further down the page."""
+    evaluation = result.get("evaluation") or {}
+    if "error" in evaluation or evaluation.get("overall_score") is None:
+        st.markdown(f"_Coming soon — quality evaluation unavailable ({evaluation.get('error', 'unknown error')})._")
+        return
+
+    dimension_scores = evaluation.get("dimension_scores") or {}
+    dimension_rows = [
+        {"Dimension": DIMENSION_LABELS.get(key, key), "Score": score, "Rating": _score_circles(score)}
+        for key, score in dimension_scores.items()
+    ]
+    st.dataframe(pd.DataFrame(dimension_rows), use_container_width=True, hide_index=True)
+
+    if evaluation.get("show_warning"):
+        st.markdown(
+            "<div style='background-color:#FFF3CD; border:1px solid #FFC107; padding:10px; "
+            "border-radius:8px; margin-top:8px; color:#856404; font-weight:600; font-size:0.85em;'>"
+            "⚠️ Data quality concerns detected — see details below"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ============================================================
@@ -338,7 +517,7 @@ with persona_col:
     )
     st.markdown(badge_html, unsafe_allow_html=True)
     if st.button("Change", key="change_persona", use_container_width=True):
-        for key in ("persona", "persona_name", "persona_icon", "result", "ticker", "elapsed"):
+        for key in ("persona", "persona_name", "persona_icon", "result", "ticker", "elapsed", "company_name", "price_history"):
             st.session_state.pop(key, None)
         st.rerun()
 
@@ -404,14 +583,24 @@ if run_clicked:
             st.session_state["result"] = result
             st.session_state["ticker"] = ticker_clean
             st.session_state["elapsed"] = elapsed
+            # Fetched once here (not on every rerun/tab-switch) since these
+            # are only used for display, not part of the analysis pipeline.
+            st.session_state["company_name"] = _get_company_name(ticker_clean)
+            st.session_state["price_history"] = _get_price_history(ticker_clean)
             st.rerun()
 
 # ============================================================
-# Section 3 — Results (only after a successful run)
+# Section 3 — Results (single continuous scrolling page, sections
+# ordered by priority, only after a successful run)
 # ============================================================
 if "result" in st.session_state:
     result = st.session_state["result"]
     elapsed = st.session_state.get("elapsed")
+    company_name = st.session_state.get("company_name") or result["ticker"]
+    price_history = st.session_state.get("price_history")
+    ratio_result = result.get("ratio_result") or {}
+    is_non_financial = result["company_type"] == "non_financial"
+    persona_short_label, persona_full_sentence = _persona_view(result, st.session_state.persona)
 
     top_left, top_right = st.columns([5, 1])
     with top_left:
@@ -419,112 +608,111 @@ if "result" in st.session_state:
             st.caption(f"Analysis completed in {elapsed:.1f}s")
     with top_right:
         if st.button("Run Another Analysis", use_container_width=True):
-            for key in ("result", "ticker", "elapsed"):
+            for key in ("result", "ticker", "elapsed", "company_name", "price_history"):
                 st.session_state.pop(key, None)
             st.rerun()
 
-    summary_tab_label = (
-        "⚖️ Arbitrage Trader Screen" if st.session_state.persona == "arbitrage_trader" else "Summary"
-    )
-    tab_summary, tab_ratios, tab_comps, tab_valuation, tab_management, tab_quality = st.tabs(
-        [summary_tab_label, "Ratios", "Comparable Companies", "Valuation Model", "Management Guidance", "Data Quality"]
-    )
+    # --------------------------------------------------------
+    # (1) HEADER — company name, ticker, sector, industry, current price
+    # --------------------------------------------------------
+    st.markdown(f"## {company_name} ({result['ticker']})")
+    header_col1, header_col2, header_col3 = st.columns(3)
+    header_col1.markdown(f"**Sector**\n\n{result.get('sector') or 'N/A'}")
+    header_col2.markdown(f"**Industry**\n\n{result.get('industry') or 'N/A'}")
+    header_col3.markdown(f"**Current Price**\n\n{_fmt_money(result.get('market_price'))}")
+
+    st.divider()
 
     # --------------------------------------------------------
-    # TAB 1 — Summary
+    # (2) SUMMARY BAND — 5 metric cards in one row
     # --------------------------------------------------------
-    with tab_summary:
-        bg_color, text_color = _verdict_color(result["reconciled_verdict"])
-        verdict_html = (
-            f'<div style="background-color:{bg_color}; padding: 24px; border-radius: 10px; margin-bottom: 20px;">'
-            '<div style="font-size: 0.9em; color: #ccc; margin-bottom: 6px;">RECONCILED VERDICT</div>'
-            f'<div style="font-size: 1.6em; font-weight: 700; color: {text_color};">{result["reconciled_verdict"]}</div>'
-            "</div>"
-        )
-        st.markdown(verdict_html, unsafe_allow_html=True)
+    sb1, sb2, sb3, sb4, sb5 = st.columns(5)
 
-        evaluation = result.get("evaluation") or {}
-        overall_score = evaluation.get("overall_score")
-        if overall_score is not None:
-            st.caption(f"Analysis Quality: {overall_score:.1f}/5.0 — {_quality_rating_label(evaluation.get('quality_rating'))}")
-
-        if st.session_state.persona == "arbitrage_trader":
-            # Margin-of-safety + leverage screen (previously labeled "Value
-            # Investor View" before the persona rename to Arbitrage Trader).
-            # Criteria unchanged: a mispricing signal alone isn't enough —
-            # this also wants a real safety cushion (25%+ margin of safety)
-            # and a balance sheet that isn't overleveraged (debt/equity
-            # under 0.5), since debt can wipe out an otherwise "cheap" stock.
-            debt_to_equity = (result.get("ratio_result") or {}).get("debt_to_equity")
-            margin_of_safety = result.get("margin_of_safety")
-            if margin_of_safety is not None and debt_to_equity is not None and margin_of_safety >= 25 and debt_to_equity < 0.5:
-                buy_line = "✅ BUY CANDIDATE — meets your investment criteria"
-            else:
-                buy_line = "❌ NOT A BUY — does not meet your criteria"
-            note = ""
-            if margin_of_safety is None or debt_to_equity is None:
-                note = " (some inputs unavailable — treated conservatively as not meeting criteria)"
+    with sb1:
+        with st.container(border=True):
+            _, verdict_text_color = _verdict_color(result["reconciled_verdict"])
+            st.caption("Reconciled Verdict")
             st.markdown(
-                f"**Arbitrage Trader View:** {buy_line} based on your 25% margin of safety requirement "
-                f"and debt/equity threshold{note}"
+                f"<span style='color:{verdict_text_color}; font-weight:700; font-size:0.95em;'>{result['reconciled_verdict']}</span>",
+                unsafe_allow_html=True,
             )
 
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
-        metric_col1.metric(
-            "Intrinsic Value",
-            _fmt_money(result.get("intrinsic_value_per_share")) if result["valuation_available"] else "N/A",
-        )
-        metric_col2.metric("Market Price", _fmt_money(result.get("market_price")))
-        metric_col3.metric(
-            "Margin of Safety",
-            _fmt_pct(result.get("margin_of_safety")) if result["valuation_available"] else "N/A",
-        )
+    with sb2:
+        with st.container(border=True):
+            st.metric(
+                "Intrinsic Value",
+                _fmt_money(result.get("intrinsic_value_per_share")) if result["valuation_available"] else "N/A",
+                _fmt_pct(result.get("margin_of_safety")) if result["valuation_available"] else None,
+            )
 
-        st.divider()
+    with sb3:
+        with st.container(border=True):
+            st.metric("Market Price", _fmt_money(result.get("market_price")))
 
-        info_col1, info_col2, info_col3, info_col4 = st.columns(4)
-        info_col1.markdown(f"**Ticker**\n\n{result['ticker']}")
-        info_col2.markdown(f"**Sector**\n\n{result.get('sector') or 'N/A'}")
-        info_col3.markdown(f"**Industry**\n\n{result.get('industry') or 'N/A'}")
-        info_col4.markdown(f"**Valuation Model**\n\n{result['valuation_model']}")
+    with sb4:
+        with st.container(border=True):
+            evaluation = result.get("evaluation") or {}
+            overall_score = evaluation.get("overall_score")
+            if overall_score is not None:
+                st.metric("Analysis Quality", f"{overall_score:.1f}/5.0", _quality_rating_label(evaluation.get("quality_rating")))
+            else:
+                st.caption("Analysis Quality")
+                st.markdown("_Coming soon_")
 
-        st.divider()
+    with sb5:
+        with st.container(border=True):
+            st.caption(f"{st.session_state.persona_name} View")
+            if persona_short_label:
+                st.markdown(f"**{persona_short_label}**")
+            else:
+                st.markdown("_Coming soon for this persona_")
 
-        if result["management_available"] and result.get("management_summary"):
-            st.subheader("Management Summary")
-            st.write(result["management_summary"])
+    if persona_full_sentence:
+        st.caption(persona_full_sentence)
 
-            extracted = result.get("management_result", {}).get("extracted_guidance", {}) or {}
-            drivers = extracted.get("key_growth_drivers") or []
-            risks = extracted.get("key_risks") or []
-
-            driver_col, risk_col = st.columns(2)
-            with driver_col:
-                st.markdown("**Top Growth Drivers**")
-                if drivers:
-                    for driver in drivers:
-                        st.markdown(f"- {driver}")
-                else:
-                    st.caption("None extracted.")
-            with risk_col:
-                st.markdown("**Top Risks**")
-                if risks:
-                    for risk in risks:
-                        st.markdown(f"- {risk}")
-                else:
-                    st.caption("None extracted.")
-        else:
-            st.info("Management guidance extraction was unavailable for this ticker.")
+    st.divider()
 
     # --------------------------------------------------------
-    # TAB 2 — Ratios
+    # (3) KEY STATISTICS | PRICE CHART | KEY FINANCIAL HIGHLIGHTS
     # --------------------------------------------------------
-    with tab_ratios:
-        ratio_result = result.get("ratio_result") or {}
+    row3_col1, row3_col2, row3_col3 = st.columns(3)
 
-        if result["company_type"] == "non_financial":
+    with row3_col1:
+        if is_non_financial:
             _render_ratio_category(
-                "Profitability",
+                "Key Statistics",
+                ratio_result,
+                [
+                    ("pe_ratio", "P/E Ratio", False),
+                    ("pb_ratio", "P/B Ratio", False),
+                    ("ps_ratio", "P/S Ratio", False),
+                    ("ev_to_ebitda", "EV / EBITDA", False),
+                    ("market_cap", "Market Cap ($)", False),
+                    ("ev", "Enterprise Value ($)", False),
+                ],
+            )
+        else:
+            st.caption(f"Sub-type: {ratio_result.get('sub_type', 'N/A')}")
+            _render_ratio_category(
+                "Key Statistics",
+                ratio_result,
+                [
+                    ("pe_ratio", "P/E Ratio", False),
+                    ("pb_ratio", "P/B Ratio", False),
+                    ("ps_ratio", "P/S Ratio", False),
+                    ("p_to_float", "Price to Float", False),
+                    ("dividend_yield", "Dividend Yield", True),
+                ],
+            )
+
+    with row3_col2:
+        st.subheader("Price Chart")
+        _render_price_chart(price_history)
+
+    with row3_col3:
+        if is_non_financial:
+            _render_ratio_category(
+                "Key Financial Highlights",
                 ratio_result,
                 [
                     ("gross_margin", "Gross Margin", True),
@@ -534,6 +722,46 @@ if "result" in st.session_state:
                     ("roa", "Return on Assets", True),
                 ],
             )
+        else:
+            _render_ratio_category(
+                "Key Financial Highlights",
+                ratio_result,
+                [
+                    ("roe", "Return on Equity", True),
+                    ("roa", "Return on Assets", True),
+                    ("nim", "Net Interest Margin (proxy)", True),
+                    ("efficiency_ratio", "Efficiency Ratio", True),
+                    ("cost_to_income", "Cost to Income", True),
+                ],
+            )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # (4) 5-YEAR FORECAST | PEER COMPARISON | DATA QUALITY SCORES
+    # --------------------------------------------------------
+    row4_col1, row4_col2, row4_col3 = st.columns(3)
+
+    with row4_col1:
+        st.subheader("5-Year Forecast")
+        _render_forecast_table(result)
+
+    with row4_col2:
+        st.subheader("Peer Comparison")
+        _render_peer_comparison(result)
+
+    with row4_col3:
+        st.subheader("Data Quality Scores")
+        _render_data_quality_scores(result)
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # Additional detail — everything from the old tabs that doesn't fit the
+    # 4 priority sections above, preserved in full rather than deleted.
+    # --------------------------------------------------------
+    with st.expander("More Ratios"):
+        if is_non_financial:
             _render_ratio_category(
                 "Liquidity & Solvency",
                 ratio_result,
@@ -541,18 +769,6 @@ if "result" in st.session_state:
                     ("current_ratio", "Current Ratio", False),
                     ("debt_to_equity", "Debt to Equity", False),
                     ("interest_coverage", "Interest Coverage", False),
-                ],
-            )
-            _render_ratio_category(
-                "Valuation",
-                ratio_result,
-                [
-                    ("pe_ratio", "P/E Ratio", False),
-                    ("pb_ratio", "P/B Ratio", False),
-                    ("ps_ratio", "P/S Ratio", False),
-                    ("ev_to_ebitda", "EV / EBITDA", False),
-                    ("market_cap", "Market Cap ($)", False),
-                    ("ev", "Enterprise Value ($)", False),
                 ],
             )
             _render_ratio_category(
@@ -573,16 +789,10 @@ if "result" in st.session_state:
                 ],
             )
         else:
-            st.caption(f"Sub-type: {ratio_result.get('sub_type', 'N/A')}")
             _render_ratio_category(
-                "Profitability",
+                "Additional Profitability",
                 ratio_result,
                 [
-                    ("roe", "Return on Equity", True),
-                    ("roa", "Return on Assets", True),
-                    ("nim", "Net Interest Margin (proxy)", True),
-                    ("efficiency_ratio", "Efficiency Ratio", True),
-                    ("cost_to_income", "Cost to Income", True),
                     ("loss_ratio", "Loss Ratio", True),
                     ("expense_ratio", "Expense Ratio", True),
                     ("combined_ratio", "Combined Ratio", True),
@@ -605,17 +815,6 @@ if "result" in st.session_state:
                 ],
             )
             _render_ratio_category(
-                "Valuation",
-                ratio_result,
-                [
-                    ("pe_ratio", "P/E Ratio", False),
-                    ("pb_ratio", "P/B Ratio", False),
-                    ("ps_ratio", "P/S Ratio", False),
-                    ("p_to_float", "Price to Float", False),
-                    ("dividend_yield", "Dividend Yield", True),
-                ],
-            )
-            _render_ratio_category(
                 "Cash Flow",
                 ratio_result,
                 [("float_proxy", "Float (Insurance Reserves, $)", False)],
@@ -634,65 +833,11 @@ if "result" in st.session_state:
             if ratio_result.get("casa_ratio_note"):
                 st.caption(f"Note: {ratio_result['casa_ratio_note']}")
 
-    # --------------------------------------------------------
-    # TAB 3 — Comparable Companies
-    # --------------------------------------------------------
-    with tab_comps:
-        comps_result = result.get("comps_result") or {}
-        if not result["comps_available"]:
-            st.info("Comparable company analysis was unavailable for this ticker (no peers found).")
-        else:
-            st.markdown(f"**Sector:** {comps_result.get('sector') or 'N/A'} &nbsp;|&nbsp; **Industry:** {comps_result.get('industry') or 'N/A'}")
-
-            comp_keys = ["pe_ratio", "pb_ratio", "ps_ratio", "ev_to_ebitda", "net_margin", "roe", "revenue_growth"]
-            comp_labels = ["P/E", "P/B", "P/S", "EV/EBITDA", "Net Margin", "ROE", "Rev Growth"]
-
-            rows = []
-            target_ratios = comps_result.get("target_ratios") or {}
-            rows.append({"Ticker": f"{result['ticker']} (target)", **{label: target_ratios.get(key) for key, label in zip(comp_keys, comp_labels)}})
-            for peer in comps_result.get("peers", []):
-                peer_ratios = peer.get("ratios") or {}
-                rows.append({"Ticker": peer["ticker"], **{label: peer_ratios.get(key) for key, label in zip(comp_keys, comp_labels)}})
-            medians = comps_result.get("peer_medians") or {}
-            rows.append({"Ticker": "Peer Median", **{label: medians.get(key) for key, label in zip(comp_keys, comp_labels)}})
-
-            comps_df = pd.DataFrame(rows)
-
-            def _highlight_target(row):
-                if "(target)" in row["Ticker"]:
-                    return ["background-color: #1B2A4A"] * len(row)
-                if row["Ticker"] == "Peer Median":
-                    return ["font-style: italic"] * len(row)
-                return [""] * len(row)
-
-            st.dataframe(
-                comps_df.style.apply(_highlight_target, axis=1).format(precision=2, na_rep="N/A"),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.markdown("**vs. Peer Median Signal**")
-            vs_median = comps_result.get("vs_median") or {}
-            badge_cols = st.columns(4)
-            badge_colors = {"PREMIUM": "#F44336", "DISCOUNT": "#4CAF50", "IN LINE": "#64B5F6"}
-            for col, key, label in zip(badge_cols, ["pe_ratio", "pb_ratio", "ev_to_ebitda", "ps_ratio"], ["P/E", "P/B", "EV/EBITDA", "P/S"]):
-                signal = vs_median.get(key)
-                color = badge_colors.get(signal, "#555")
-                col.markdown(
-                    f"<div style='text-align:center; padding:8px; border-radius:6px; background-color:{color}22; border:1px solid {color};'>"
-                    f"<div style='font-size:0.8em; color:#ccc;'>{label}</div>"
-                    f"<div style='font-weight:700; color:{color};'>{signal or 'N/A'}</div></div>",
-                    unsafe_allow_html=True,
-                )
-
-    # --------------------------------------------------------
-    # TAB 4 — Valuation Model
-    # --------------------------------------------------------
-    with tab_valuation:
+    with st.expander("Valuation Model Details"):
         valuation_result = result.get("valuation_result") or {}
         if not result["valuation_available"]:
-            st.warning(f"Valuation model unavailable: {valuation_result.get('error', 'unknown error')}")
-        elif result["company_type"] == "non_financial":
+            st.markdown(f"_Coming soon — valuation model unavailable ({valuation_result.get('error', 'unknown error')})._")
+        elif is_non_financial:
             st.subheader("WACC Breakdown")
             wacc_col1, wacc_col2, wacc_col3, wacc_col4 = st.columns(4)
             wacc_col1.metric("Risk-Free Rate", _fmt_pct(valuation_result.get("risk_free_rate", 0) * 100 if valuation_result.get("risk_free_rate") is not None else None))
@@ -705,17 +850,6 @@ if "result" in st.session_state:
                 f"Revenue Growth Rate ({valuation_result.get('growth_source', 'N/A')}): "
                 f"{_fmt_pct(valuation_result.get('revenue_growth_rate', 0) * 100 if valuation_result.get('revenue_growth_rate') is not None else None)}"
             )
-
-            st.divider()
-            st.subheader("5-Year Projection")
-            years = [f"Year {i}" for i in range(1, 6)]
-            projected_revenues = valuation_result.get("projected_revenues") or []
-            projected_fcfs = valuation_result.get("projected_fcfs") or []
-            if projected_revenues and projected_fcfs:
-                chart_df = pd.DataFrame(
-                    {"Projected Revenue": projected_revenues, "Projected FCFF": projected_fcfs}, index=years
-                )
-                st.bar_chart(chart_df)
 
             st.divider()
             st.subheader("Terminal Value & Enterprise Value Build-Up")
@@ -733,34 +867,38 @@ if "result" in st.session_state:
             st.caption(f"Payout ratio source: {valuation_result.get('payout_ratio_source', 'N/A')}")
 
             st.divider()
-            st.subheader("5-Year Forecast")
-            forecasted_eps = valuation_result.get("forecasted_eps") or []
-            forecasted_book_values = valuation_result.get("forecasted_book_values") or []
-            forecasted_dividends = valuation_result.get("forecasted_dividends") or []
-            forecasted_residual_incomes = valuation_result.get("forecasted_residual_incomes") or []
-            if forecasted_eps:
-                forecast_df = pd.DataFrame(
-                    {
-                        "EPS": forecasted_eps,
-                        "Book Value / Share": forecasted_book_values,
-                        "Dividends / Share": forecasted_dividends,
-                        "Residual Income": forecasted_residual_incomes,
-                    },
-                    index=[f"Year {i}" for i in range(1, 6)],
-                )
-                st.dataframe(forecast_df.style.format(precision=2), use_container_width=True)
-
-            st.divider()
             st.metric("Terminal Residual Value", _fmt_money(valuation_result.get("terminal_residual_value")))
 
-    # --------------------------------------------------------
-    # TAB 5 — Management Guidance
-    # --------------------------------------------------------
-    with tab_management:
+    with st.expander("Management Guidance"):
         management_result = result.get("management_result") or {}
         if not result["management_available"]:
-            st.warning(f"Management guidance extraction unavailable: {management_result.get('error', 'unknown error')}")
+            st.markdown(f"_Coming soon — management guidance extraction unavailable ({management_result.get('error', 'unknown error')})._")
         else:
+            extracted = management_result.get("extracted_guidance") or {}
+
+            if result.get("management_summary"):
+                st.subheader("Management Summary")
+                st.write(result["management_summary"])
+
+            drivers = extracted.get("key_growth_drivers") or []
+            risks = extracted.get("key_risks") or []
+            driver_col, risk_col = st.columns(2)
+            with driver_col:
+                st.markdown("**Top Growth Drivers**")
+                if drivers:
+                    for driver in drivers:
+                        st.markdown(f"- {driver}")
+                else:
+                    st.caption("None extracted.")
+            with risk_col:
+                st.markdown("**Top Risks**")
+                if risks:
+                    for risk in risks:
+                        st.markdown(f"- {risk}")
+                else:
+                    st.caption("None extracted.")
+
+            st.divider()
             st.subheader("10-K Sections Analyzed")
             sections_found = management_result.get("sections_found") or []
             word_counts = management_result.get("section_word_counts") or {}
@@ -778,7 +916,6 @@ if "result" in st.session_state:
 
             st.divider()
             st.subheader("Extracted Guidance")
-            extracted = management_result.get("extracted_guidance") or {}
             g1, g2 = st.columns(2)
             with g1:
                 st.markdown(f"**Revenue Growth Guidance:** {extracted.get('revenue_growth_guidance') if extracted.get('revenue_growth_guidance') is not None else 'Not stated'}")
@@ -817,59 +954,14 @@ if "result" in st.session_state:
             else:
                 st.caption("No overrides recommended (confidence below 0.6 or guidance was qualitative only).")
 
-            st.divider()
-            st.subheader("Full Management Summary")
-            st.write(management_result.get("management_summary") or "Not available.")
-
-    # --------------------------------------------------------
-    # TAB 6 — Data Quality
-    # --------------------------------------------------------
-    with tab_quality:
+    with st.expander("Data Quality Details"):
         evaluation = result.get("evaluation") or {}
-
         if "error" in evaluation or evaluation.get("overall_score") is None:
-            st.warning(f"Quality evaluation unavailable: {evaluation.get('error', 'unknown error')}")
+            st.markdown(f"_Coming soon — quality evaluation unavailable ({evaluation.get('error', 'unknown error')})._")
         else:
-            # --- Section 1: overall quality score ---------------------------
-            if evaluation.get("show_warning"):
-                st.markdown(
-                    "<div style='background-color:#4A3B14; border:1px solid #FFC107; padding:14px; "
-                    "border-radius:8px; margin-bottom:16px; color:#FFC107; font-weight:600;'>"
-                    "⚠️ Data quality concerns detected — review the details below before making investment decisions"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-
-            rating_label = _quality_rating_label(evaluation.get("quality_rating"))
-            rating_color = QUALITY_RATING_COLORS.get(rating_label, "#888")
-
-            score_col, badge_col = st.columns([1, 2])
-            with score_col:
-                st.metric("Overall Quality Score", f"{evaluation['overall_score']:.2f} / 5.0")
-            with badge_col:
-                st.markdown(
-                    f"<div style='margin-top:22px;'><span style='background:{rating_color}22; "
-                    f"border:1px solid {rating_color}; color:{rating_color}; padding:8px 18px; "
-                    f"border-radius:20px; font-weight:700; font-size:1.1em;'>{evaluation.get('quality_rating')}</span></div>",
-                    unsafe_allow_html=True,
-                )
-
-            st.divider()
-
-            # --- Section 2: dimension scores table ---------------------------
-            st.subheader("Dimension Scores")
-            dimension_scores = evaluation.get("dimension_scores") or {}
-            dimension_rows = [
-                {"Dimension": DIMENSION_LABELS.get(key, key), "Score": score, "Rating": _score_circles(score)}
-                for key, score in dimension_scores.items()
-            ]
-            st.dataframe(pd.DataFrame(dimension_rows), use_container_width=True, hide_index=True)
-
-            st.divider()
-
-            # --- Section 3: issues and recommendations ------------------------
-            st.subheader("Issues and Recommendations")
             dimension_details = evaluation.get("dimension_details") or {}
+
+            st.subheader("Issues and Recommendations")
             any_failed = False
             for dimension_key, details in dimension_details.items():
                 for failure in details.get("failed_checks") or []:
@@ -883,11 +975,9 @@ if "result" in st.session_state:
             for recommendation in evaluation.get("recommendations") or []:
                 st.markdown(f"- {recommendation}")
 
-            st.divider()
-
-            # --- Section 4: missing fields ------------------------------------
             missing_fields = (dimension_details.get("data_completeness") or {}).get("missing_fields") or []
             if missing_fields:
+                st.divider()
                 st.subheader("Missing Fields")
                 st.markdown("The following data fields were unavailable from SEC EDGAR for this ticker:")
                 for field in missing_fields:
@@ -895,8 +985,6 @@ if "result" in st.session_state:
                     st.markdown(f"- **{field}** — affects {affects}")
 
             st.divider()
-
-            # --- Section 5: evaluation metadata --------------------------------
             st.subheader("Evaluation Metadata")
             meta_col1, meta_col2, meta_col3 = st.columns(3)
             meta_col1.markdown(f"**Ticker**\n\n{evaluation.get('ticker')}")
